@@ -1,0 +1,27 @@
+services:
+  workbench:
+    build: .
+    image: sherd-stitch-workbench:latest
+    container_name: sherd-workbench
+    ports:
+      # 宿主机端口:容器端口；如要换宿主机端口，改左侧即可
+      - "8080:8080"
+    environment:
+      # 容器内监听端口，需与右侧映射端口一致
+      PORT: "8080"
+      # 单个陶片照片上传大小上限（MB）
+      MAX_UPLOAD_MB: "20"
+      DATA_DIR: "/data"
+    volumes:
+      # SQLite 数据库与上传图片持久化到命名卷
+      - sherd-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8080/api/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  sherd-data:

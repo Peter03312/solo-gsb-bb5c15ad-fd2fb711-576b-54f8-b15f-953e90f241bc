@@ -1,0 +1,20 @@
+{
+  "name": "sherd-stitch-workbench",
+  "version": "1.0.0",
+  "description": "考古工作室陶片拼接推演 Web 工作台",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.js",
+    "smoke": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
