@@ -2,6 +2,7 @@ import { api } from './api.js';
 import { esc, toast, openModal, confirmAsync } from './ui.js';
 import { openScaleModal, openAlignModal } from './modals.js';
 import { openReviseSeamModal } from './revise.js';
+import { openBatchModal } from './batch.js';
 import {
   sherdPpm, sherdMm, computeCards, sherdWorldPose, hitSherd, applyPose, DEG,
 } from './geo-client.js';
@@ -20,6 +21,7 @@ export async function mountWorkspace(projectId) {
         <div class="sherd-list" id="sherd-list"></div>
         <div class="footer">
           <button id="btn-new-seam">新建接缝</button>
+          <button id="btn-batch">批量试拼</button>
         </div>
       </aside>
 
@@ -546,6 +548,19 @@ export async function mountWorkspace(projectId) {
 
   // ---------- 新建接缝 ----------
   document.getElementById('btn-new-seam').onclick = chooseSeamEnds;
+
+  // ---------- 批量试拼（候选接缝一批试算 → 单事务确认）----------
+  document.getElementById('btn-batch').onclick = () => {
+    const scaled = state.sherds.filter((s) => s.scale_px);
+    if (scaled.length < 2) return toast('至少要有两片已标记比例尺的陶片', 'warn');
+    openBatchModal(state, {
+      onApplied: async (next) => {
+        applyServerState(next);
+        toast(`整批候选接缝已依序采纳，版本推进到 v${next.project.version}（只增加一次）`, 'success');
+      },
+      onError: handleWriteError,
+    });
+  };
 
   function chooseSeamEnds() {
     const scaled = state.sherds.filter((s) => s.scale_px);

@@ -52,4 +52,12 @@ export const api = {
     request('POST', `/api/seams/${seamId}/revision-preview`, { body: payload }).then((r) => r.data),
   reviseSeam: (seamId, version, payload) =>
     request('PATCH', `/api/seams/${seamId}`, { version, body: payload }).then((r) => r.data),
+  // 批量试拼：试算只读、不带版本；确认必须带试算所基于的 Base-Version。
+  batchPreview: (pid, candidates) =>
+    request('POST', `/api/projects/${pid}/seams/batch-preview`, { body: { candidates } }).then((r) => r.data),
+  batchCommit: (pid, version, candidates, baseVersion, fingerprint) =>
+    request('POST', `/api/projects/${pid}/seams/batch-commit`, {
+      version,
+      body: { candidates, base_version: baseVersion, batch_fingerprint: fingerprint },
+    }).then((r) => r.data),
 };

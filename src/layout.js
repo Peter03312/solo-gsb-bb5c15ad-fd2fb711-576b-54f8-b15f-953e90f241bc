@@ -151,9 +151,15 @@ function round3(v) {
 
 // 主入口：计算全方案布局（含每个成环接缝的闭合残差与冲突链细节）。
 // 布局不持久化——每次都从接缝现算，撤销/修订接缝后不可能残留旧位姿。
+// 批量试算的候选接缝是不入库的“虚拟接缝”（id 为负），携带 _ord 作为采纳序，
+// 排在全部既有接缝之后；普通接缝按 id 升序（采纳先后）。
+function seamOrder(s) {
+  return Number.isFinite(s._ord) ? s._ord : s.id;
+}
+
 function computeLayoutDetailed(sherds, seams, toleranceMm) {
   const sherdIds = sherds.map((s) => s.id).sort((a, b) => a - b);
-  const sortedSeams = seams.slice().sort((a, b) => a.id - b.id);
+  const sortedSeams = seams.slice().sort((a, b) => seamOrder(a) - seamOrder(b));
   const metricsById = new Map(sherds.map((s) => [s.id, sherdMetrics(s)]));
 
   const { componentMembers, componentTreeEdges, cycleEdges } =
@@ -233,8 +239,10 @@ function computeLayoutDetailed(sherds, seams, toleranceMm) {
     });
   }
 
-  residuals.sort((a, b) => a.seam_id - b.seam_id);
-  cycleDetails.sort((a, b) => a.seam_id - b.seam_id);
+  const orderOfSeam = new Map(sortedSeams.map((s) => [s.id, seamOrder(s)]));
+  const bySeamOrder = (a, b) => orderOfSeam.get(a.seam_id) - orderOfSeam.get(b.seam_id) || a.seam_id - b.seam_id;
+  residuals.sort(bySeamOrder);
+  cycleDetails.sort(bySeamOrder);
   groups.sort((a, b) => a.root_sherd_id - b.root_sherd_id);
   unconnected.sort((a, b) => a - b);
   return { groups, unconnected, residuals, cycleDetails };
@@ -353,4 +361,74 @@ function evaluateNewSeam(sherds, seams, candidate, toleranceMm) {
   };
 }
 
-module.exports = { computeLayout, computeLayoutDetailed, evaluateNewSeam, evaluateSeamRevision, sherdMetrics };
+// 批量试拼试算：既有接缝全部保持其采纳序（id 升序），候选接缝按用户填写顺序
+// 依次参与布局——候选整体排在既有接缝之后（“已有接缝优先于候选”）。
+//
+// 候选以不入库的“虚拟接缝”表示：id 取负数（-(index+1)），携带
+//   _ord（= 既有接缝数 + index，决定 Kruskal 采纳序）与
+//   candidate_index（用户填写序号，0 起）。
+// 不修改任何入参，不写库；返回假设接缝集合、重算布局、每条候选在布局中扮演的
+// 角色（生成树/成环/冗余重复边）以及全部超差闭合环（天然仅可能由候选成环产生）。
+function evaluateSeamBatch(sherds, existingSeams, candidates, toleranceMm) {
+  const baseSeams = existingSeams.slice().sort((a, b) => a.id - b.id);
+  // 采纳序显式编号：既有接缝按 id 升序得 0..m-1，候选按填写顺序紧接其后，
+  // 保证“已有接缝优先于候选、候选按填写顺序参与布局”，且与既有接缝真实 id 大小无关。
+  const ordBase = baseSeams.map((s, i) => ({ ...s, _ord: i }));
+  const virtualSeams = candidates.map((cand, i) => ({
+    id: -(i + 1),
+    project_id: null,
+    from_id: cand.from_id,
+    to_id: cand.to_id,
+    theta_deg: cand.theta_deg,
+    tx: cand.tx,
+    ty: cand.ty,
+    join_note: cand.join_note || '',
+    created_at: null,
+    _ord: baseSeams.length + i,
+    candidate_index: i,
+  }));
+  const allSeams = ordBase.concat(virtualSeams);
+
+  const detailed = computeLayoutDetailed(sherds, allSeams, toleranceMm);
+  const treeSeamIds = new Set();
+  detailed.groups.forEach((g) => g.tree_seam_ids.forEach((id) => treeSeamIds.add(id)));
+  const cycleIds = new Set(detailed.cycleDetails.map((c) => c.seam_id));
+
+  // 每条候选的布局角色（按填写顺序）：
+  //   tree  桥接两个组件，成为生成树接缝，决定布局；
+  //   cycle 两端已连通，成为成环接缝（残差见 residuals / violations）；
+  //   duplicate 两端之间在同一“采纳序位置”完全重复的边（并查集上与 cycle 同判，
+  //          这里统一以 cycle 对待——它仍会产生闭合残差）。
+  const candidate_results = virtualSeams.map((v) => ({
+    index: v.candidate_index,
+    virtual_id: v.id,
+    from_id: v.from_id,
+    to_id: v.to_id,
+    role: treeSeamIds.has(v.id) ? 'tree' : 'cycle',
+  }));
+
+  // 超差闭合环全部来自候选成环边（既有成环边在既有方案下本应在容差内，
+  // 候选树边只在既有组件之间搭桥，不改变组件内既有树路径）。
+  const violations = detailed.cycleDetails
+    .filter((c) => !c.within_tolerance)
+    .map((c) => {
+      const v = allSeams.find((s) => s.id === c.seam_id);
+      return { ...c, candidate_index: v && v.candidate_index };
+    });
+
+  return {
+    all_seams: allSeams,
+    layout: { groups: detailed.groups, unconnected: detailed.unconnected, residuals: detailed.residuals },
+    candidate_results,
+    violations,
+  };
+}
+
+module.exports = {
+  computeLayout,
+  computeLayoutDetailed,
+  evaluateNewSeam,
+  evaluateSeamRevision,
+  evaluateSeamBatch,
+  sherdMetrics,
+};

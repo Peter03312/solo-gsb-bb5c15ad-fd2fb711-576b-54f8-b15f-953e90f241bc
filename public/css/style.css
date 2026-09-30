@@ -191,3 +191,16 @@ table.list a { color: var(--accent); font-weight: 600; text-decoration: none; }
 .scale-canvas { background: #fff; border: 1px solid var(--line); border-radius: 8px; cursor: crosshair; display:block; max-width:100%; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); padding: 6px 4px 0; }
 .legend i { display:inline-block; width: 18px; height: 0; border-top: 3px solid; vertical-align: middle; margin-right: 4px; }
+
+/* 批量试拼候选行 */
+.bt-row {
+  display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px;
+  background: #fffdf8;
+}
+.bt-row.bt-row-bad { border-color: var(--danger); background: #fbeae8; }
+.bt-idx { font-weight: 700; font-family: ui-monospace, Menlo, monospace; color: #2b6cb0; min-width: 30px; padding-bottom: 6px; }
+.bt-row select, .bt-row input[type="number"] { width: 86px; }
+.bt-row .bt-note { flex: 1; min-width: 180px; }
+.bt-row .bt-note input { width: 100%; }
+.bt-del { padding: 6px 10px; }
