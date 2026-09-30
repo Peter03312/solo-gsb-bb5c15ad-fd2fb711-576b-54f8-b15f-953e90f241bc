@@ -2,6 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 
@@ -75,6 +76,118 @@ function parseRevisionBody(body, seam) {
     ? seam.join_note
     : str(body.join_note, 'join_note', { max: 2000, required: false });
   return { theta_deg: theta, tx, ty, join_note: joinNote };
+}
+
+// ---------- 批量试拼 ----------
+
+const MAX_BATCH_SEAMS = 200;
+
+// 解析并校验一整批候选接缝（保持填写顺序）。
+// index 为 0 起的数组下标；校验失败时 400 并指出候选序号（序号 = index+1）。
+// 陶片不属于本方案、未标比例尺、接缝连接同一片或参数非法均在试算前拒绝整批。
+function parseBatchCandidates(body, projectId) {
+  const list = body && body.candidates;
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new HttpError(400, 'candidates 必须是非空数组（至少一条候选接缝）');
+  }
+  if (list.length > MAX_BATCH_SEAMS) {
+    throw new HttpError(400, `一批最多 ${MAX_BATCH_SEAMS} 条候选接缝`);
+  }
+
+  const sherdRows = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(projectId);
+  const sherdById = new Map(sherdRows.map((s) => [s.id, s]));
+
+  const candidates = list.map((c, index) => {
+    const at = `候选 #${index + 1}`;
+    const fail = (msg) => {
+      const e = new HttpError(400, `${at}：${msg}`);
+      e.extra = { candidate_index: index + 1 };
+      throw e;
+    };
+    if (!c || typeof c !== 'object') return fail('参数必须是对象');
+    const fromId = num(c.from_id, 'from_id', { min: 1 });
+    const toId = num(c.to_id, 'to_id', { min: 1 });
+    if (fromId === toId) return fail('接缝必须连接两片不同的陶片');
+    const theta = num(c.theta_deg, 'theta_deg', { min: -360, max: 360 });
+    const tx = num(c.tx, 'tx', { min: -100000, max: 100000 });
+    const ty = num(c.ty, 'ty', { min: -100000, max: 100000 });
+    const joinNote = str(c.join_note, 'join_note', { max: 2000, required: false });
+    const from = sherdById.get(fromId);
+    const to = sherdById.get(toId);
+    if (!from || !to) return fail('接缝两端的陶片不属于本方案或不存在');
+    if (!from.scale_px || !from.scale_mm || !to.scale_px || !to.scale_mm) {
+      return fail('接缝两端陶片都必须先标记毫米比例尺');
+    }
+    return { from_id: fromId, to_id: toId, theta_deg: theta, tx, ty, join_note: joinNote };
+  });
+  return { candidates, sherds: sherdRows };
+}
+
+// 整批候选内容指纹：确认时必须原样回传同一批（顺序敏感），服务端据此比对。
+// 指纹只依赖规范化后的候选内容（数字经 JSON 序列化、说明已规范化为字符串）。
+function batchToken(candidates) {
+  return crypto.createHash('sha256').update(JSON.stringify(candidates)).digest('hex');
+}
+
+// 批量试算返回体：与 statePayload 同构（project/sherds/seams/layout），
+// 但 seams 为“既有接缝 + 临时 id 的候选接缝”假设集合，layout 为整批加入后的现算结果。
+function batchTrialPayload(project, sherds, result) {
+  const candidateByTempId = new Map(result.candidate_seams.map((s) => [s.id, s._candidate_index]));
+  const fakeState = { project, sherds, seams: result.trial_seams, computed: result.layout };
+  const payload = statePayload(fakeState);
+  payload.seams = payload.seams.map((s) => {
+    const idx = candidateByTempId.get(s.id);
+    return idx ? { ...s, candidate_index: idx } : s;
+  });
+  payload.layout.residuals = payload.layout.residuals.map((r) => {
+    const idx = candidateByTempId.get(r.seam_id);
+    return idx ? { ...r, candidate_index: idx } : r;
+  });
+  payload.base_version = project.version;
+  payload.preview_only = true;
+  payload.candidate_count = result.candidate_seams.length;
+  payload.batch_token = batchToken(
+    result.candidate_seams.map((s) => ({
+      from_id: s.from_id, to_id: s.to_id, theta_deg: s.theta_deg,
+      tx: s.tx, ty: s.ty, join_note: s.join_note,
+    }))
+  );
+  return payload;
+}
+
+// 把整批试算的超差闭合环整理为对外结构：每条指出超差闭合接缝（含候选序号）、
+// 偏差与冲突链（生成树陶片/接缝路径 + 闭合接缝），链中候选接缝同样标注候选序号。
+function buildBatchViolations(result, sherds, toleranceMm) {
+  const seamsById = new Map(result.trial_seams.map((s) => [s.id, s]));
+  const sherdById = new Map(sherds.map((s) => [s.id, s]));
+  return result.violations.map((v) => {
+    const closing = seamsById.get(v.seam_id);
+    return {
+      reason: 'cycle_tolerance_exceeded',
+      seam_id: v.seam_id,
+      candidate_index: closing._candidate_index || null,
+      from_id: v.from_id,
+      to_id: v.to_id,
+      deviation_mm: v.distance_mm,
+      rotation_deg: v.rotation_deg,
+      tolerance_mm: toleranceMm,
+      conflict_chain: {
+        sherds: v.conflict_chain.sherd_path.map((id) => ({ id, label: sherdById.get(id).label })),
+        seams: v.conflict_chain.seam_path.map((sid) => {
+          const se = seamsById.get(sid);
+          const item = { id: sid, from_id: se.from_id, to_id: se.to_id, join_note: se.join_note };
+          if (se._candidate_index) item.candidate_index = se._candidate_index;
+          return item;
+        }),
+        closing_seam: {
+          id: v.seam_id,
+          candidate_index: closing._candidate_index || null,
+          from_id: v.from_id,
+          to_id: v.to_id,
+        },
+      },
+    };
+  });
 }
 
 // 把布局引擎算出的超差闭合环整理为对外错误体：逐条超差接缝 + 冲突链。
@@ -488,6 +601,97 @@ app.patch('/api/seams/:id', wrap((req, res) => {
   txn();
 
   res.json(statePayload(loadState(seam.project_id)));
+}));
+
+// ---------- 批量试拼（一批候选接缝：只读试算 → 单事务确认）----------
+//
+// 两步：
+//   POST /api/projects/:id/seams/batch-preview  只读试算（不要求 Base-Version，不改接缝/版本）
+//   POST /api/projects/:id/seams/batch          确认（必须带当前 Base-Version + 同一批内容）
+//
+// 布局规则：既有接缝优先（id/排序不变），候选按填写顺序追加参与布局（见
+// layout.evaluateBatchSeams）。试算不改任何状态；确认时在同一事务内基于当前版本
+// 重新读取并全量重算、复核“全部闭合环”，通过才依填写顺序逐条采纳且版本只 +1，
+// 任一闭合环超差则整批不生效（回滚，接缝/版本/布局均不变）。
+// 方案版本已变化（Base-Version 落后）→ 409，要求重新试算；批次内容与试算不一致
+// （batch_token 不符）→ 422 batch_content_mismatch，同样要求重新试算。
+
+app.post('/api/projects/:id/seams/batch-preview', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  const project = getProjectOr404(pid);
+  const { candidates, sherds } = parseBatchCandidates(req.body || {}, pid);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+  // 临时 id 以“全表”当前最大 id 为基，与确认时的全局自增 id 对齐。
+  const globalMax = db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM seams').get().m;
+  const result = layout.evaluateBatchSeams(sherds, seams, candidates, project.tolerance_mm, globalMax);
+  const payload = batchTrialPayload(project, sherds, result);
+  payload.violations = buildBatchViolations(result, sherds, project.tolerance_mm);
+  res.json(payload);
+}));
+
+app.post('/api/projects/:id/seams/batch', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  const project = getProjectOr404(pid);
+  // 确认必须基于试算时的同一版本：落后/超前一律 409，且不得套用旧试算。
+  checkVersion(req, project);
+  const { candidates } = parseBatchCandidates(req.body || {}, pid);
+
+  const token = body => (body && typeof body.batch_token === 'string' ? body.batch_token : null);
+  const insertSeam = db.prepare(
+    'INSERT INTO seams(project_id, from_id, to_id, theta_deg, tx, ty, join_note) VALUES (?,?,?,?,?,?,?)'
+  );
+  if (!token(req.body)) {
+    throw new HttpError(400, '缺少 batch_token：请先对整批进行只读试算，再用试算返回的 batch_token 确认');
+  }
+
+  // 单事务：版本复核 → 基于当前接缝/陶片用“同一批内容”重新试算 → 复核全部闭合环
+  // → 超差抛错回滚（整批不生效）；通过则按填写顺序逐条插入，版本只 bump 一次。
+  const txn = db.transaction(() => {
+    const current = db.prepare('SELECT * FROM projects WHERE id = ?').get(pid);
+    if (current.version !== project.version) {
+      throw new HttpError(409, '版本冲突：方案已被其他人修改，请重新试算整批后再确认', {
+        reason: 'batch_version_conflict',
+        current_version: current.version,
+        your_version: project.version,
+      });
+    }
+    const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
+    const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+    // 同事务内取全表最大 id 作为临时 id 基数：无其他方案并发插入时，
+    // 随后逐条插入的真实自增 id 与试算临时 id 一致。
+    const globalMax = db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM seams').get().m;
+    const result = layout.evaluateBatchSeams(sherds, seams, candidates, current.tolerance_mm, globalMax);
+
+    // 同一批内容校验：确认负载须与试算所基于的候选（含顺序、参数、说明）完全一致。
+    const expectedToken = batchToken(candidates);
+    if (token(req.body) !== expectedToken) {
+      throw new HttpError(422, '批次内容与试算时不一致（候选或顺序有改动），请重新试算后再确认', {
+        reason: 'batch_content_mismatch',
+      });
+    }
+
+    if (result.violations.length) {
+      const violations = buildBatchViolations(result, sherds, current.tolerance_mm);
+      throw new HttpError(422,
+        `整批加入后有 ${violations.length} 条闭合接缝残差超过 ${current.tolerance_mm} mm 容差，整批未生效（接缝/版本/布局均不变）。`,
+        { reason: 'batch_cycle_tolerance_exceeded', violations });
+    }
+
+    // 通过：依填写顺序采纳。同事务无并发写入，自增 id 即试算临时 id，
+    // 故确认后现算布局与试算结果一致。
+    for (const c of candidates) {
+      insertSeam.run(pid, c.from_id, c.to_id, c.theta_deg, c.tx, c.ty, c.join_note);
+    }
+    bump(pid);
+  });
+  txn();
+
+  const state = loadState(pid);
+  res.status(201).json({
+    ...statePayload(state),
+    batch_committed: true,
+    committed_count: candidates.length,
+  });
 }));
 
 // ---------- 错误处理 ----------

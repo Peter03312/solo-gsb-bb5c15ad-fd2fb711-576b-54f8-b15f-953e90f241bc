@@ -10,6 +10,7 @@
 - **修订已采纳接缝**：可对任意一条接缝修改**旋转角 θ、毫米平移 (tx, ty) 与说明**（接缝身份与采纳排序不变）。提交前先做**只读预览**——按原接缝身份及排序重算各陶片位姿与**每一个闭合环**残差、逐条列出**超差接缝的冲突链**，预览**不改动方案**；确认时服务器基于当前版本**原子地重新校验全部闭合环**，任一残差超差即拒绝（422，接缝/版本/布局均不变），版本落后返回 409，成功后接缝 ID 与排序不变、版本只递增一次、读取布局与预览一致。
 - **撤销接缝即整体重算**连通组与位姿（布局从不持久化），不会沿用失效布局。
 - **多人编辑乐观锁**：每个写请求须带 `Base-Version`；版本落后时返回 `409` 并在网页弹窗提示，绝不静默覆盖；页面还会每 10 秒轮询版本并提示他人更新。
+- **批量试拼（一批候选接缝）**：在左栏“批量试拼…”中按顺序填写每条候选的**两端陶片、旋转角、毫米平移与说明**，工作台**只读试算**整批加入后的连通组、陶片位姿与**每个闭合环残差**；布局遵循“**已有接缝优先，候选按填写顺序参与**”，超容差时指出**候选序号、偏差与冲突链**。试算不改接缝与版本；确认须使用**同一批内容**与试算所基于的**方案版本**，在服务器**单事务**内重新校验全部闭合环，通过才**依序采纳且版本只增加一次**，否则整批不生效。
 
 ## 运行方式
 
@@ -51,7 +52,7 @@ npm start
 npm test        # 即 node test/smoke.js
 ```
 
-覆盖：建表就绪 → 建方案/上传/比例尺 → 接缝拼组与位姿传播 → 撤销断组重算 → 成环残差为 0 采纳 → 成环超差 422 拒绝且布局不变 → 过期版本 409 / 缺版本 428 → 接缝修订预览（只读、不改版本/接缝、给出超差冲突链）→ 修订确认 422 原子拒绝 / 容差内成功（ID 与排序不变、版本 +1、读取布局与预览一致）/ 409 / 428 / 400 / 404 → 修订成环接缝与仅改说明。
+覆盖：建表就绪 → 建方案/上传/比例尺 → 接缝拼组与位姿传播 → 撤销断组重算 → 成环残差为 0 采纳 → 成环超差 422 拒绝且布局不变 → 过期版本 409 / 缺版本 428 → 接缝修订预览（只读、不改版本/接缝、给出超差冲突链）→ 修订确认 422 原子拒绝 / 容差内成功（ID 与排序不变、版本 +1、读取布局与预览一致）/ 409 / 428 / 400 / 404 → 修订成环接缝与仅改说明 → 批量试拼只读试算（候选序号、连通组/位姿/每个闭合环残差、超差候选与冲突链、不改接缝版本）→ 批量确认（同批内容 token + Base-Version，单事务全环复核，依序采纳且版本只 +1、布局与试算一致）/ 超差 422 整批不生效 / 内容不一致 422 / 409 / 428 / 前置 400（陶片不属于本方案、未标比例尺、连接同一片、参数非法并指出候选序号）。
 
 ## 使用说明
 
@@ -79,6 +80,18 @@ npm test        # 即 node test/smoke.js
    - 点“确认修订”时服务器基于当前方案版本**重新原子校验全部闭合环**：全部在容差内才写入，
      接缝 ID 与排序不变、版本只 +1，随后画布与预览完全一致；若期间他人已改方案则按
      `Base-Version` 约定返回 409（不会套用旧预览）；若重算仍超差则 422 且原接缝、版本、布局均不变。
+9. **批量试拼候选接缝**：点左栏 **批量试拼…**，在弹窗中按顺序添加候选行（可用 ↑/↓ 调整顺序、✕ 删除），
+   每行填写 **A 片 → B 片、旋转角 θ、毫米平移 tx/ty、接缝说明**：
+   - 点 **试算整批**（只读）：画布以蓝色画出本批候选、`候N` 标注第 N 条，预览**整批加入后**的连通组与陶片位姿；
+     下方列出**每个闭合环残差**。布局规则是**已有接缝优先（其 id/排序不变），候选严格按填写顺序追加参与**；
+     超容差的闭合环红色标出，并明确给出**候选序号、偏差（mm/°）与冲突链**（生成树陶片/接缝路径 + 闭合接缝，链中候选同样标注 `候N`）。
+     试算**不会改动方案**（接缝数、版本均不变），可反复修改后重新试算。
+   - 试算通过（无超差）后 **确认采纳整批** 才可点：确认携带试算返回的 `batch_token`（同一批内容指纹，顺序敏感）
+     与当前 `Base-Version`；服务器在**单事务**内基于当前版本重新读取并复核**全部闭合环**，全部在容差内才按填写顺序
+     逐条插入、版本**只 +1**，随后布局与试算一致；任一闭合环超差则 **422 整批不生效**（接缝/版本/布局均不变）。
+   - 期间若方案已被他人修改（版本变化）返回 **409**；若批次内容相对试算有改动返回 **422 batch_content_mismatch**；
+     两种情况都要求**重新试算**后再确认，绝不套用旧试算。
+   - 陶片不属于本方案、未标比例尺、候选连接同一片或参数非法时，在试算/确认前即以 **400** 拒绝，并指出第几条候选。
 
 ## 可配置项
 
@@ -158,29 +171,113 @@ curl -s -X PATCH http://localhost:8080/api/seams/1 \
 既有接缝接口与返回契约保持不变：`POST /api/projects/{id}/seams`（采纳/成环拒绝）、
 `DELETE /api/seams/{id}`（撤销）、`GET /api/projects/{id}`（读取现算布局）。
 
+## 批量试拼 HTTP API（可调用）
+
+把一批候选接缝作为整体“先只读试算、后单事务确认”。**布局规则：已有接缝优先（其 id 与 Kruskal 采纳排序不变），
+候选严格按填写顺序追加其后参与布局**。候选参数与单条接缝一致：`theta_deg`（°，-360~360）、`tx`、`ty`
+（毫米，-100000~100000）、`join_note`（≤2000 字，可省略），两端必须是同方案内两片**已标比例尺**的不同陶片。
+单批最多 200 条。
+
+### 第一步：只读试算（不需要 `Base-Version`，不改接缝/版本）
+
+```
+POST /api/projects/{id}/seams/batch-preview
+Content-Type: application/json
+
+{
+  "candidates": [
+    { "from_id": 1, "to_id": 2, "theta_deg": 0, "tx": -10, "ty": 0, "join_note": "口沿 1-2" },
+    { "from_id": 2, "to_id": 3, "theta_deg": 0, "tx": -10, "ty": 0, "join_note": "腹部 2-3" },
+    { "from_id": 1, "to_id": 3, "theta_deg": 0, "tx": -20, "ty": 0, "join_note": "复核 1-3" }
+  ]
+}
+```
+
+返回体与 `GET /api/projects/{id}` 同构（`project` / `sherds` / `seams` / `layout`），其中：
+
+- `seams` 是“既有接缝 + 本批候选”的假设集合，按布局次序（既有在前、候选按序）排列；
+  候选接缝用**临时 id**（严格大于既有 id，仅在试算负载内出现）并额外带 `candidate_index`（从 1 起的填写序号）；
+- `layout` 为整批加入后的现算结果：`groups`（连通组、陶片位姿、位置依据链、包围盒）、`unconnected`、
+  `residuals`（**每个闭合环**残差；由候选闭合的环其残差项也带 `candidate_index`）；
+- `base_version`：当前方案版本（确认时作为 `Base-Version` 原样回传）；
+- `batch_token`：本批内容（含顺序、参数、说明）的指纹，确认时必须原样回传；
+- `candidate_count`、`preview_only: true`；
+- `violations[]`：全部超差闭合环，元素含 `candidate_index`（超差闭合缝为第几条候选；既有缝为 `null`）、
+  `deviation_mm`、`rotation_deg`、`tolerance_mm` 与 `conflict_chain`
+  （`sherds` 陶片路径、`seams` 生成树路径及说明、其中候选带 `candidate_index`、`closing_seam` 闭合缝）。无超差为空数组。
+
+### 第二步：确认（必须带当前 `Base-Version` 与同一批 `batch_token`）
+
+```
+POST /api/projects/{id}/seams
+Base-Version: 7
+Content-Type: application/json
+
+{
+  "batch_token": "<第一步返回的 token>",
+  "candidates": [ …与试算完全相同的同一批内容（顺序敏感）… ]
+}
+```
+
+- `201`：成功。服务器在**单事务**内复核版本一致、用同一批内容基于当前接缝/陶片**重新全量重算并校验全部闭合环**，
+  通过才按填写顺序逐条插入并把版本**只 +1**；响应为标准负载外加 `batch_committed: true`、`committed_count`，
+  `layout` 与试算几何一致（采纳后为真实接缝，不再带 `candidate_index` 标注）。
+- `422 batch_cycle_tolerance_exceeded`：确认时重算发现闭合环超容差，`error.violations[]` 给出每条超差缝
+  （含候选序号）与冲突链；**整批不生效**（事务回滚，接缝/版本/布局均不变）。
+- `422 batch_content_mismatch`：批次内容（或顺序、参数、说明）与试算时不一致，须重新试算。
+- `409 batch_version_conflict`：`Base-Version` 与当前版本不一致（方案已被他人修改），返回
+  `current_version` / `your_version`，本次拒绝，**须重新试算**，不得套用旧试算。
+- `428`：缺少 `Base-Version`；`400`：缺少 `batch_token`、批次为空/超长，或任一候选非法
+  （陶片不属于本方案、未标比例尺、连接同一片、参数越界等），错误体带 `candidate_index` 指出第几条候选。
+  以上均不改变任何状态。
+
+### curl 示例
+
+```bash
+# 1) 只读试算（保存返回体，取 base_version / batch_token）
+curl -s -X POST http://localhost:8080/api/projects/1/seams/batch-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"candidates":[
+    {"from_id":1,"to_id":2,"theta_deg":0,"tx":-10,"ty":0,"join_note":"口沿 1-2"},
+    {"from_id":2,"to_id":3,"theta_deg":0,"tx":-10,"ty":0,"join_note":"腹部 2-3"},
+    {"from_id":1,"to_id":3,"theta_deg":0,"tx":-20,"ty":0,"join_note":"复核 1-3"}]}'
+
+# 2) 用同一批内容 + 试算返回的 batch_token，基于当前版本确认（假设 base_version 为 7）
+curl -s -X POST http://localhost:8080/api/projects/1/seams/batch \
+  -H 'Base-Version: 7' -H 'Content-Type: application/json' \
+  -d '{"batch_token":"<上一步返回的 token>","candidates":[
+    {"from_id":1,"to_id":2,"theta_deg":0,"tx":-10,"ty":0,"join_note":"口沿 1-2"},
+    {"from_id":2,"to_id":3,"theta_deg":0,"tx":-10,"ty":0,"join_note":"腹部 2-3"},
+    {"from_id":1,"to_id":3,"theta_deg":0,"tx":-20,"ty":0,"join_note":"复核 1-3"}]}'
+```
+
 ## 数据模型
 
 - `projects`：方案（名称、毫米容差、乐观锁 `version`）。
 - `sherds`：陶片（图片文件、图像像素宽高、比例尺 `scale_px`/`scale_mm`）。
 - `seams`：有向接缝 `from_id → to_id`，`theta_deg / tx / ty`（把 from 局部毫米坐标
   映射到 to 局部毫米坐标），`join_note` 接缝说明。修订仅 UPDATE 该接缝的这四个字段，
-  **不改 id / from_id / to_id**，因此采纳排序（Kruskal 次序）稳定。
+  **不改 id / from_id / to_id**，因此采纳排序（Kruskal 次序）稳定。批量试拼的候选接缝
+  **不入库、无实体**：试算时以临时 id（全表 `MAX(seams.id)+1…`，带 1 起的 `candidate_index`）
+  现算；确认通过后在同一事务按填写顺序逐条 INSERT，真实自增 id 与临时 id 对齐（无并发插入时完全相同）。
 - 每次写事务都会把 `projects.version + 1`；布局（连通组、位姿）**只在读取时现算**，
-  不入库，因此撤销/修订后天然不会残留旧位置。接缝修订的预览也只现算、不落库。
+  不入库，因此撤销/修订后天然不会残留旧位置。接缝修订的预览与批量试拼的试算也只现算、不落库。
+  批量确认整批只 bump **一次**版本；超差回滚则版本不变。
 
 ## 目录结构
 
 ```
-server.js              Express 入口与 REST API（含乐观锁、成环拒绝、接缝修订预览/确认、上传）
+server.js              Express 入口与 REST API（含乐观锁、成环拒绝、接缝修订预览/确认、批量试拼试算/确认、上传）
 src/db.js              SQLite 打开与建表
 src/geo.js             刚体变换（旋转/平移、求逆、复合、偏差度量）纯函数
-src/layout.js          连通组/生成树(Kruskal 采纳序)/位姿传播/成环评估/残差/接缝修订重算(evaluateSeamRevision)
+src/layout.js          连通组/生成树(Kruskal 采纳序)/位姿传播/成环评估/残差/接缝修订重算(evaluateSeamRevision)/批量候选试算(evaluateBatchSeams)
 public/                前端（原生 ES Module + Canvas，无需构建）
   index.html, css/style.css
   js/app.js            路由与首页
   js/workspace.js      工作台三栏、画布绘制与交互、轮询
   js/modals.js         比例尺标定弹窗、接缝对齐弹窗
   js/revise.js         接缝修订弹窗（改参 → 自动预览位姿/残差/冲突链 → 确认）
+  js/batch.js          批量试拼弹窗（按序填写候选 → 只读试算整批 → 同批同版本单事务确认）
   js/geo-client.js     前端几何与卡片布局
   js/api.js, js/ui.js  fetch 封装 / toast、弹窗
 test/smoke.js          端到端冒烟测试

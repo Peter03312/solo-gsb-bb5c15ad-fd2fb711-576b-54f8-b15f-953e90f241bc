@@ -191,3 +191,15 @@ table.list a { color: var(--accent); font-weight: 600; text-decoration: none; }
 .scale-canvas { background: #fff; border: 1px solid var(--line); border-radius: 8px; cursor: crosshair; display:block; max-width:100%; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); padding: 6px 4px 0; }
 .legend i { display:inline-block; width: 18px; height: 0; border-top: 3px solid; vertical-align: middle; margin-right: 4px; }
+
+/* ---------- 批量试拼候选行 ---------- */
+.bt-row {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: #fff;
+}
+.bt-row .bt-idx { flex: 0 0 auto; font-size: 12px; color: var(--accent); font-weight: 600; min-width: 46px; }
+.bt-row select { flex: 1 1 120px; min-width: 90px; padding: 4px 6px; }
+.bt-row input[type="number"] { flex: 0 1 90px; min-width: 64px; padding: 4px 6px; }
+.bt-row input[type="text"] { flex: 2 1 160px; min-width: 120px; padding: 4px 6px; }
+.bt-row .bt-row-ops { flex: 0 0 auto; display: flex; gap: 4px; }
+.bt-row .bt-row-ops button { padding: 3px 8px; font-size: 12px; }

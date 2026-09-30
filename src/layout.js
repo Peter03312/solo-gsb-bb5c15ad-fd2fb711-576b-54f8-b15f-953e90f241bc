@@ -353,4 +353,50 @@ function evaluateNewSeam(sherds, seams, candidate, toleranceMm) {
   };
 }
 
-module.exports = { computeLayout, computeLayoutDetailed, evaluateNewSeam, evaluateSeamRevision, sherdMetrics };
+// 批量候选试拼（一批候选接缝，只读现算、不落库）：
+// 规则——既有接缝优先（保留全部既有 id 与 Kruskal 采纳排序），候选严格按填写顺序
+// 追加在其后参与布局。候选临时 id 从 startId+1 起按填写顺序递增；startId 由 API 层
+// 传入“全表 seams 的 MAX(id)”（跨方案全局自增），使得同方案无并发插入时，确认时的
+// 真实自增 id 与临时 id 完全一致；即使其他方案并发插入导致整体平移，相对次序
+// （全部既有 < 全部候选、候选按序）仍不变，布局几何不变。临时 id 只在试算/预览负载内
+// 出现（候选另带 1 起的 _candidate_index），不会写入数据库。
+// 试算返回整批加入后的连通组、陶片位姿、每个闭合环残差，以及全部超差闭合环
+// （含闭合接缝是否候选及其候选序号、生成树冲突链）。
+function evaluateBatchSeams(sherds, seams, candidates, toleranceMm, startId) {
+  const sortedExisting = seams.slice().sort((a, b) => a.id - b.id);
+  const base = Number.isInteger(startId)
+    ? startId
+    : sortedExisting.reduce((m, s) => Math.max(m, s.id), 0);
+  const candidateSeams = candidates.map((c, i) => ({
+    id: base + i + 1,
+    from_id: c.from_id,
+    to_id: c.to_id,
+    theta_deg: c.theta_deg,
+    tx: c.tx,
+    ty: c.ty,
+    join_note: c.join_note || '',
+    _candidate_index: i + 1,
+  }));
+  const trialSeams = [...sortedExisting, ...candidateSeams];
+
+  const detailed = computeLayoutDetailed(sherds, trialSeams, toleranceMm);
+  return {
+    trial_seams: trialSeams,
+    candidate_seams: candidateSeams,
+    layout: {
+      groups: detailed.groups,
+      unconnected: detailed.unconnected,
+      residuals: detailed.residuals,
+    },
+    violations: detailed.cycleDetails.filter((c) => !c.within_tolerance),
+  };
+}
+
+module.exports = {
+  computeLayout,
+  computeLayoutDetailed,
+  evaluateNewSeam,
+  evaluateSeamRevision,
+  evaluateBatchSeams,
+  sherdMetrics,
+};

@@ -364,6 +364,174 @@ async function main() {
   assert(r.json.seams.find((x) => x.id === seam02.id).join_note === '仅改说明', '说明已更新');
   assert(r.json.seams.length === 6, '全程接缝数保持 6');
 
+  // ===================== 批量试拼（只读试算 → 单事务确认） =====================
+  r = await req('POST', '/api/projects', { body: { name: '批量试拼方案', tolerance_mm: 2 } });
+  assert(r.status === 201, '创建批量试拼方案');
+  const bpid = r.json.project.id;
+  let bver = r.json.project.version;
+  const bs = [];
+  for (let i = 0; i < 6; i++) {
+    const form = multipart({ label: `B${i}`, img_w: '100', img_h: '100' }, png);
+    const rr = await req('POST', `/api/projects/${bpid}/sherds`, { version: bver, raw: form.payload, body: form });
+    if (rr.status !== 201) throw new Error('上传失败: ' + JSON.stringify(rr.json));
+    bver = rr.json.project.version;
+    bs.push(rr.json.sherds[rr.json.sherds.length - 1].id);
+  }
+  // 仅前 5 片标比例尺；bs[5] 保持未标定，用于验证试算拒绝未标比例尺的候选。
+  for (const id of bs.slice(0, 5)) {
+    r = await req('PATCH', `/api/sherds/${id}/scale`, { version: bver, body: { scale_px: 100, scale_mm: 10 } });
+    assert(r.status === 200, '批量方案比例尺');
+    bver = r.json.project.version;
+  }
+  const link = (a, b, tx, note) => ({ from_id: a, to_id: b, theta_deg: 0, tx, ty: 0, join_note: note || '' });
+  // 试算负载会在候选接缝/残差上额外标注 candidate_index；采纳后为真实接缝，不带该标注。
+  // 比较布局时去掉该标注，验证几何（连通组/位姿/残差值）完全一致。
+  const layoutOf = (p) => ({
+    ...p.layout,
+    residuals: (p.layout.residuals || []).map(({ candidate_index, ...rest }) => rest),
+  });
+
+  // --- 非法/前置校验：试算前拒绝整批（候选序号、不改状态） ---
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: [] } });
+  assert(r.status === 400, '空批次 => 400');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`,
+    { body: { candidates: [link(bs[0], bs[0], -10)] } });
+  assert(r.status === 400 && r.json.error.candidate_index === 1, '候选连接同一片 => 400 并指出候选序号 1');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`,
+    { body: { candidates: [link(bs[0], bs[1], -10), link(bs[1], bs[1], -10)] } });
+  assert(r.status === 400 && r.json.error.candidate_index === 2, '第 2 条候选自连 => 400 指出候选 #2');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`,
+    { body: { candidates: [link(999999, bs[1], -10)] } });
+  assert(r.status === 400, '陶片不属于本方案 => 400');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`,
+    { body: { candidates: [link(bs[5], bs[0], -10)] } });
+  assert(r.status === 400 && r.json.error.candidate_index === 1, '候选涉及未标比例尺陶片 => 400 指出候选 #1');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`,
+    { body: { candidates: [{ ...link(bs[0], bs[1], -10), theta_deg: 999 }] } });
+  assert(r.status === 400, '旋转角非法 => 400');
+
+  // --- 试算：两条候选桥接 B0-B1、B1-B2（B2 在 x=20），只读不改 ---
+  let cand = [link(bs[0], bs[1], -10, '批 0-1'), link(bs[1], bs[2], -10, '批 1-2')];
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: cand } });
+  assert(r.status === 200 && r.json.preview_only === true, '批量试算返回只读预览');
+  assert(r.json.base_version === bver && typeof r.json.batch_token === 'string' && r.json.batch_token.length === 64,
+    '试算给出 base_version 与 64 位 batch_token');
+  assert(r.json.candidate_count === 2, '候选计数为 2');
+  const trialIds = r.json.seams.filter((s) => s.candidate_index).map((s) => s.id);
+  assert(trialIds.length === 2 && trialIds[1] === trialIds[0] + 1,
+    '候选临时 id 连续、按填写顺序递增');
+  assert(r.json.seams.find((s) => s.candidate_index === 1).join_note === '批 0-1', '候选按序号标注');
+  const bg = r.json.layout.groups.find((g) => g.member_ids.includes(bs[0]));
+  assert(bg && bg.poses[bs[2]].x === 20, '试算：B2 沿候选链推导到 x=20');
+  assert(bg.tree_seam_ids.join(',') === trialIds.join(','), '既有接缝优先：候选按序进入生成树');
+  assert(r.json.layout.unconnected.sort((a, b) => a - b).join(',') === [bs[3], bs[4], bs[5]].sort((a, b) => a - b).join(','),
+    '试算：未涉及的 B3、B4 与未标定的 B5 仍为未连通片');
+  assert(r.json.violations.length === 0, '无超差');
+  r = await req('GET', `/api/projects/${bpid}`);
+  assert(r.json.seams.length === 0 && r.json.project.version === bver, '试算不改接缝与版本');
+
+  // --- 确认整批：单事务采纳，版本只 +1，布局与试算一致 ---
+  let btrial = (await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: cand } })).json;
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: cand, batch_token: btrial.batch_token } });
+  assert(r.status === 201 && r.json.batch_committed === true && r.json.committed_count === 2,
+    '确认整批成功（201，committed_count=2）');
+  assert(r.json.project.version === bver + 1, '整批采纳版本只递增一次');
+  bver = r.json.project.version;
+  const firstIds = r.json.seams.map((s) => s.id);
+  assert(r.json.seams.length === 2 && firstIds.join(',') === trialIds.join(','),
+    '候选按填写顺序采纳，真实 id 与试算临时 id 相同（无并发插入）');
+  assert(JSON.stringify(r.json.layout) === JSON.stringify(layoutOf(btrial)),
+    '确认后读取布局与试算完全一致');
+  assert(r.json.layout.groups[0].poses[bs[1]].x === 10 && r.json.layout.groups[0].poses[bs[2]].x === 20,
+    '采纳后位姿与试算相同（B1=10,B2=20）');
+
+  // --- 缺 Base-Version / 缺 token / 过期版本 ---
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`, { body: { candidates: cand, batch_token: btrial.batch_token } });
+  assert(r.status === 428, '确认缺 Base-Version => 428');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`, { version: bver, body: { candidates: cand } });
+  assert(r.status === 400, '确认缺 batch_token => 400');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver - 1, body: { candidates: cand, batch_token: btrial.batch_token } });
+  assert(r.status === 409 && r.json.error.current_version === bver, '过期版本确认 => 409 要求重新试算');
+
+  // --- 内容与试算不一致：用 A 的 token 提交 B 内容 => 422 batch_content_mismatch，不生效 ---
+  const candPrime = [link(bs[0], bs[1], -10, '批 0-1 改了说明'), link(bs[1], bs[2], -10, '批 1-2')];
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: candPrime, batch_token: btrial.batch_token } });
+  assert(r.status === 422 && r.json.error.reason === 'batch_content_mismatch',
+    '批次内容与试算不一致 => 422 batch_content_mismatch');
+  r = await req('GET', `/api/projects/${bpid}`);
+  assert(r.json.seams.length === 2 && r.json.project.version === bver, '内容不一致不写入、版本不变');
+
+  // --- 既有接缝优先：候选 B2->B3（桥接到新片，tx=-10）+ 候选 B0->B3 成环。
+  //     正确闭合 tx 应为 -30（B3 在 30）；给 -26 => 偏差 4mm 超差，指出候选序号 2。
+  const bad = [link(bs[2], bs[3], -10, '批 2-3'), link(bs[0], bs[3], -26, '批 0-3 错误')];
+  r = await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: bad } });
+  assert(r.status === 200 && r.json.violations.length === 1, '试算发现 1 条超差闭合环');
+  const bv = r.json.violations[0];
+  assert(bv.candidate_index === 2 && bv.deviation_mm === 4,
+    `超差闭合接缝为候选 #2、偏差 4mm（实际 ${bv.candidate_index}/${bv.deviation_mm}）`);
+  assert(bv.conflict_chain.closing_seam.candidate_index === 2, '冲突链闭合缝标注候选 #2');
+  // 冲突链：生成树路径 0→1→2→3，沿两条既有接缝与候选 #1
+  const badChainExpected = [firstIds[0], firstIds[1], firstIds[1] + 1];
+  assert(bv.conflict_chain.seams.map((s) => s.id).join(',') === badChainExpected.join(','),
+    '冲突链沿两条既有接缝再到候选 #1（既有优先，候选按序）');
+  assert(bv.conflict_chain.seams[2].candidate_index === 1, '冲突链第 3 条是候选 #1');
+  assert(bv.conflict_chain.sherds.map((s) => s.id).join(',') === [bs[0], bs[1], bs[2], bs[3]].join(','),
+    '冲突链陶片路径 0→1→2→3');
+  // 试算残差中候选成环边带候选序号
+  const rr2 = r.json.layout.residuals.find((x) => x.candidate_index === 2);
+  assert(rr2 && rr2.within_tolerance === false && rr2.distance_mm === 4, '残差列表标注候选 #2 超差');
+
+  // 确认超差整批 => 422，整批不生效（无新接缝、版本/布局不变）
+  btrial = (await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: bad } })).json;
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: bad, batch_token: btrial.batch_token } });
+  assert(r.status === 422 && r.json.error.reason === 'batch_cycle_tolerance_exceeded',
+    '确认时单事务重算超差 => 422 整批不生效');
+  assert(r.json.error.violations.length === 1 && r.json.error.violations[0].candidate_index === 2,
+    '422 返回候选序号与冲突链');
+  r = await req('GET', `/api/projects/${bpid}`);
+  assert(r.json.seams.length === 2 && r.json.project.version === bver, '422 后接缝数仍 2、版本不变');
+  assert(r.json.layout.groups[0].poses[bs[2]].x === 20, '422 后布局不变（B2 仍在 20），B3 未连通');
+  assert(!r.json.layout.groups[0].member_ids.includes(bs[3]), 'B3 未被采纳进组');
+
+  // --- 修正为闭合偏差 0：整批通过，4 条接缝同组 ---
+  const good = [link(bs[2], bs[3], -10, '批 2-3'), link(bs[0], bs[3], -30, '批 0-3 复核')];
+  btrial = (await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: good } })).json;
+  assert(btrial.violations.length === 0, '修正后试算无超差');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: good, batch_token: btrial.batch_token } });
+  assert(r.status === 201, '整批（含成环候选）确认成功');
+  bver = r.json.project.version;
+  assert(r.json.seams.length === 4, '采纳后共 4 条接缝');
+  const g03 = r.json.layout.residuals.find((x) => x.from_id === bs[0] && x.to_id === bs[3]);
+  assert(g03 && g03.distance_mm === 0 && g03.within_tolerance, '成环候选 B0->B3 残差 0');
+  assert(r.json.layout.groups[0].poses[bs[3]].x === 30, 'B3 位姿 x=30，与试算一致');
+  assert(JSON.stringify(r.json.layout) === JSON.stringify(layoutOf(btrial)), '读取布局与试算一致');
+
+  // --- 既有成环已容差内，新增候选不破坏：再试 B3->B4 单条桥接（不成环） ---
+  const one = [link(bs[3], bs[4], -10, '批 3-4')];
+  btrial = (await req('POST', `/api/projects/${bpid}/seams/batch-preview`, { body: { candidates: one } })).json;
+  assert(btrial.violations.length === 0, '加入桥接候选后既有闭合环仍容差内');
+  const res03 = btrial.layout.residuals.find((x) => x.from_id === bs[0] && x.to_id === bs[3]);
+  assert(res03 && res03.distance_mm === 0, '既有环 B0->B3 残差保持 0（刚体平移不改变环内闭合）');
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: one, batch_token: btrial.batch_token } });
+  assert(r.status === 201, '单条桥接候选整批确认成功');
+  bver = r.json.project.version;
+  assert(r.json.seams.length === 5 && r.json.layout.groups[0].member_ids.length === 5, '五片全部连通');
+
+  // --- 确认期间他人改了方案（版本推进）：用旧版本+旧 token => 409，整批不生效，须重新试算 ---
+  r = await req('PATCH', `/api/projects/${bpid}`, { version: bver, body: { tolerance_mm: 3 } });
+  assert(r.status === 200, '他人修改方案设置，版本推进');
+  const verAfterOther = r.json.project.version;
+  r = await req('POST', `/api/projects/${bpid}/seams/batch`,
+    { version: bver, body: { candidates: one, batch_token: btrial.batch_token } });
+  assert(r.status === 409, '确认时版本已变化 => 409，要求重新试算');
+  assert(r.json.seams === undefined, '409 不返回负载（未采纳）');
+
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
 }
